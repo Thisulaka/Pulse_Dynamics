@@ -269,6 +269,8 @@ static uint8_t  hrRates[4] = {0};
 static uint8_t  hrRateIdx = 0;
 static int      hrBpm = 0;
 
+//jygjhgjhg
+
 static void hrInit() {
   if (!hrSensor.begin(Wire, I2C_SPEED_FAST, 0x57)) {
     Serial.println("[MAX30102] NOT FOUND");
