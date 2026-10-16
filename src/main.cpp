@@ -1,9 +1,15 @@
 /*
- * Smart Posture Monitor – neck-mounted unit
+ * Smart Posture Monitor – neck-mounted unit  (+ Wi-Fi web dashboard)
  * MCU      : ESP32-C3 Super Mini
- * Sensors  : MPU6050 (0x69, AD0=VCC) + MAX30102 (0x57) on the same I2C bus
+ * Sensors  : 2 x MPU6050 on the same I2C bus
+ *              TOP    sensor: AD0 = VCC -> address 0x69
+ *              BOTTOM sensor: AD0 = GND -> address 0x68
+ *            + MAX30102 (0x57)
  * Outputs  : WS2812 status LED (native RMT driver), vibration motor, buzzer
- * Input    : Pushbutton on GPIO 3, active-HIGH (3.3V when pressed)
+ * Input    : Pushbutton on GPIO 5, active-HIGH (3.3V when pressed)
+ * Network  : sends readings to server.js (web dashboard) over Wi-Fi;
+ *            the dashboard can calibrate, switch the vibrator on/off,
+ *            silence the heart-rate alarm and change the angle limits.
  *
  * Hold button 1 s    -> beep + calibrate (sit/stand upright and stay still)
  * Double-tap button  -> disable / re-enable the vibrator (light + sound feedback)
@@ -12,10 +18,16 @@
  * Forward crouch     -> LED red throb + escalating haptic patterns
  * Sideways tilt      -> LED fast yellow blink + tick haptic pattern
  * Abnormal HR (long) -> red LED + buzzer blink together
+ * Early warning      -> LED orange breathing (forward lean above 70% of the limit,
+ *                       or sideways tilt above 70% of its limit) – no vibration
+ * Slow slouch        -> LED orange flash + two short beeps (forward lean rising
+ *                       steadily over the last 3 minutes, before it reaches the limit)
  *
- * MPU6050 mounting: X axis arrow points UP.
- * Forward/back tilt and left/right tilt are measured relative to the
- * calibrated upright posture.
+ * MPU6050 mounting: X axis arrow points UP on BOTH sensors.
+ * Each sensor is calibrated in the upright posture. The posture angles used by
+ * the rest of the program are the DIFFERENCE between the two sensors:
+ *      lean     = top forward angle - bottom forward angle   (neck vs. upper body)
+ *      sideLean = top side angle    - bottom side angle
  *
  * NOTE: heart-rate readings from a neck-mounted optical sensor are for
  * wellness/testing only and are not a medical measurement.
@@ -23,8 +35,19 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <WebSocketsClient.h>      // "WebSockets" library by Markus Sattler (links2004)
 #include "MAX30105.h"
 #include "heartRate.h"
+
+// ============================================================================
+//  WI-FI / DASHBOARD SETTINGS  – change these
+// ============================================================================
+const char*    WIFI_SSID     = "Pavithan ";              // hotspot name, exactly (note the space)
+const char*    WIFI_PASSWORD = "Pavi123456";             // hotspot password
+const char*    SERVER_IP     = "172.20.10.4";            // laptop IP running server.js (ipconfig)
+const uint16_t SERVER_PORT   = 3000;
+const char*    DEVICE_KEY    = "my-secret-device-key";   // must match DEVICE_KEY in server.js
 
 #ifndef ESP_ARDUINO_VERSION_MAJOR
 #define ESP_ARDUINO_VERSION_MAJOR 2
@@ -63,13 +86,26 @@ constexpr uint32_t CAL_TIMEOUT_MS    = 15000;
 constexpr bool     TILT_ON_Y         = false;  // true if forward/back tilt shows up on the sensor's Y axis
 constexpr float    FORWARD_SIGN      = -1.0f;  // forward lean = positive angle (flip if reversed)
 
-constexpr float    BAD_ANGLE_DEG       = 25.0f; // forward lean that counts as a crouch
-constexpr float    GOOD_ANGLE_DEG      = 15.0f; // must come back below this (hysteresis)
+// (these four are variables so the dashboard sliders can change them)
+float              BAD_ANGLE_DEG       = 25.0f; // forward lean that counts as a crouch
+float              GOOD_ANGLE_DEG      = 15.0f; // must come back below this (hysteresis)
 constexpr uint32_t BAD_HOLD_MS         = 1500;  // forward lean must persist this long
 
-constexpr float    SIDE_BAD_ANGLE_DEG  = 20.0f; // sideways tilt (either direction) that counts as bad
-constexpr float    SIDE_GOOD_ANGLE_DEG = 12.0f; // must come back below this (hysteresis)
+float              SIDE_BAD_ANGLE_DEG  = 20.0f; // sideways tilt (either direction) that counts as bad
+float              SIDE_GOOD_ANGLE_DEG = 12.0f; // must come back below this (hysteresis)
 constexpr uint32_t SIDE_HOLD_MS        = 1500;  // sideways tilt must persist this long
+
+// --- early warning (gentle LED only, before the limit is reached)
+constexpr float    EARLY_WARN_RATIO  = 0.7f;   // 70% of the limit (25 deg -> 17.5 deg)
+
+// --- slow-slouch detection (trend line through the last 3 minutes of forward lean)
+constexpr uint32_t TREND_SAMPLE_MS   = 5000;   // store the lean every 5 s
+constexpr int      TREND_SAMPLES     = 36;     // 36 x 5 s = 3 minutes
+constexpr int      TREND_MIN_SAMPLES = 12;     // need at least 1 minute of data
+constexpr float    DRIFT_SLOPE       = 1.5f;   // rising faster than 1.5 deg/min ...
+constexpr float    DRIFT_RISE        = 4.0f;   // ... and risen at least 4 deg in the window
+constexpr uint32_t DRIFT_SHOW_MS     = 10000;  // report the warning to the dashboard for 10 s
+constexpr uint32_t DRIFT_REPEAT_MS   = 120000; // at most one slow-slouch warning per 2 minutes
 
 constexpr uint32_t GOOD_HOLD_MS      = 800;    // upright must persist this long
 constexpr float    MOTION_IGNORE_DPS = 80.0f;  // ignore samples during fast movement
@@ -84,14 +120,15 @@ constexpr long     HR_MIN_IR         = 20000;  // below this = no skin contact
 
 // --- heart-rate alarm
 constexpr int      HR_LOW_BPM        = 45;     // below this = abnormal
-constexpr int      HR_HIGH_BPM       = 50;    // above this = abnormal
-constexpr uint32_t HR_ALERT_HOLD_MS  = 3000;  // abnormal for this long -> alarm
+constexpr int      HR_HIGH_BPM       = 120;    // above this = abnormal (normal resting HR is about 60-100)
+constexpr uint32_t HR_ALERT_HOLD_MS  = 30000;  // abnormal for 30 seconds -> alarm
 constexpr uint32_t HR_RECOVER_MS     = 5000;   // normal/no signal this long -> reset / clear alarm
 constexpr uint32_t HR_SNOOZE_MS      = 300000; // button tap silences the alarm for 5 min
 constexpr uint32_t HR_BLINK_MS       = 400;    // red LED + buzzer blink half-period
 constexpr uint16_t HR_ALARM_FREQ     = 2700;   // alarm tone (Hz)
 
-constexpr uint32_t TELEMETRY_MS      = 500;
+constexpr uint32_t TELEMETRY_MS      = 500;    // human-readable line on Serial
+constexpr uint32_t SEND_MS           = 200;    // JSON reading to the dashboard (5 per second)
 
 // ============================================================================
 //  OUTPUT DRIVERS (PWM) – compatible with Arduino-ESP32 core 2.x and 3.x
@@ -139,6 +176,7 @@ static const Note SND_CAL_DONE[]   = {{2200, 90}, {0, 50}, {3000, 140}};
 static const Note SND_ERROR[]      = {{600, 200}, {0, 100}, {450, 300}};
 static const Note SND_HAPTIC_OFF[] = {{2600, 90}, {0, 40}, {1800, 90}, {0, 40}, {1200, 180}}; // descending
 static const Note SND_HAPTIC_ON[]  = {{1200, 90}, {0, 40}, {1800, 90}, {0, 40}, {2600, 180}}; // ascending
+static const Note SND_DRIFT[]      = {{2000, 80}, {0, 120}, {2000, 80}};                      // two soft beeps
 
 static bool        hrAlarmActive = false;    // heart-rate alarm owns the buzzer while true
 static bool        alarmBuzzOn   = false;
@@ -209,44 +247,46 @@ static void hapticUpdate(uint32_t now) {
 }
 
 // ============================================================================
-//  MPU6050 (raw register driver – no external library)
+//  MPU6050 x2 (raw register driver – no external library)
+//  Both sensors share the I2C bus; AD0 selects the address.
 // ============================================================================
-constexpr uint8_t MPU_ADDR = 0x69;   // AD0 = VCC
+constexpr uint8_t MPU_TOP = 0x69;   // top sensor,    AD0 = VCC
+constexpr uint8_t MPU_BOT = 0x68;   // bottom sensor, AD0 = GND
 
 struct ImuSample { float ax, ay, az, gx, gy, gz; };   // g, deg/s
 
-static bool mpuWriteReg(uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(MPU_ADDR);
+static bool mpuWriteReg(uint8_t addr, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(addr);
   Wire.write(reg); Wire.write(val);
   return Wire.endTransmission() == 0;
 }
-static bool mpuReadReg(uint8_t reg, uint8_t& val) {
-  Wire.beginTransmission(MPU_ADDR);
+static bool mpuReadReg(uint8_t addr, uint8_t reg, uint8_t& val) {
+  Wire.beginTransmission(addr);
   Wire.write(reg);
   if (Wire.endTransmission(false) != 0) return false;
-  if (Wire.requestFrom((int)MPU_ADDR, 1) != 1) return false;
+  if (Wire.requestFrom((int)addr, 1) != 1) return false;
   val = Wire.read();
   return true;
 }
-static bool mpuInit() {
-  if (!mpuWriteReg(0x6B, 0x80)) return false;   // device reset
+static bool mpuInit(uint8_t addr) {
+  if (!mpuWriteReg(addr, 0x6B, 0x80)) return false;   // device reset
   delay(100);
-  mpuWriteReg(0x6B, 0x01);                      // wake, PLL with gyro X
+  mpuWriteReg(addr, 0x6B, 0x01);                      // wake, PLL with gyro X
   delay(10);
-  mpuWriteReg(0x1A, 0x03);                      // DLPF ~44 Hz
-  mpuWriteReg(0x19, 9);                         // 1 kHz / 10 = 100 Hz
-  mpuWriteReg(0x1B, 0x00);                      // gyro  +-250 dps
-  mpuWriteReg(0x1C, 0x00);                      // accel +-2 g
+  mpuWriteReg(addr, 0x1A, 0x03);                      // DLPF ~44 Hz
+  mpuWriteReg(addr, 0x19, 9);                         // 1 kHz / 10 = 100 Hz
+  mpuWriteReg(addr, 0x1B, 0x00);                      // gyro  +-250 dps
+  mpuWriteReg(addr, 0x1C, 0x00);                      // accel +-2 g
   uint8_t who = 0;
-  if (!mpuReadReg(0x75, who)) return false;
-  Serial.printf("[MPU6050] WHO_AM_I = 0x%02X\n", who);
+  if (!mpuReadReg(addr, 0x75, who)) return false;
+  Serial.printf("[MPU6050 0x%02X] WHO_AM_I = 0x%02X\n", addr, who);
   return true;
 }
-static bool mpuRead(ImuSample& s) {
-  Wire.beginTransmission(MPU_ADDR);
+static bool mpuRead(uint8_t addr, ImuSample& s) {
+  Wire.beginTransmission(addr);
   Wire.write(0x3B);
   if (Wire.endTransmission(false) != 0) return false;
-  if (Wire.requestFrom((int)MPU_ADDR, 14) != 14) return false;
+  if (Wire.requestFrom((int)addr, 14) != 14) return false;
   int16_t v[7];
   for (int i = 0; i < 7; i++) {
     uint8_t hi = Wire.read();
@@ -269,16 +309,13 @@ static uint8_t  hrRates[4] = {0};
 static uint8_t  hrRateIdx = 0;
 static int      hrBpm = 0;
 
-//jygjhgjhg
-
 static void hrInit() {
   if (!hrSensor.begin(Wire, I2C_SPEED_FAST, 0x57)) {
     Serial.println("[MAX30102] NOT FOUND");
     hrOk = false;
     return;
   }
-  // brightness, sample avg, LED mode (2=red+IR), sample rate, pulse width, ADC range
-  hrSensor.setup(0xFF, 4, 2, 100, 411, 4096);
+  hrSensor.setup();          // default settings (same as the working test): 100 samples/s after averaging
   hrOk = true;
   Serial.println("[MAX30102] OK");
 }
@@ -361,17 +398,25 @@ static State state = ST_IDLE;
 static bool isMonitoring() { return state == ST_GOOD || state == ST_BAD_FWD || state == ST_BAD_SIDE; }
 static bool isBadPosture() { return state == ST_BAD_FWD || state == ST_BAD_SIDE; }
 
+// --- per-sensor data (one copy for the top sensor, one for the bottom sensor)
+struct Tilt {
+  float fx = 1, fy = 0, fz = 0;                 // filtered accel (X is up)
+  float sx = 0, sy = 0, sz = 0;                 // calibration sums (accel)
+  float gsx = 0, gsy = 0, gsz = 0;              // calibration sums (gyro)
+  float refPitch = 0, refSide = 0;              // upright reference angles (deg)
+  float gbx = 0, gby = 0, gbz = 0;              // gyro bias
+  float lean = 0, sideLean = 0;                 // this sensor's own angles
+};
+static Tilt topS, botS;
+static bool botPresent = false;   // true only if the bottom MPU6050 (0x68) was found at boot
+
 // --- calibration data
-static float    calSumX, calSumY, calSumZ, calGSumX, calGSumY, calGSumZ;
 static uint16_t calN = 0;
 static uint32_t calStartMs = 0;
-static float    refPitch = 0, refSide = 0;          // upright reference angles (deg)
-static float    gBiasX = 0, gBiasY = 0, gBiasZ = 0; // gyro bias
 
-// --- posture data
-static float    fx = 1, fy = 0, fz = 0;             // filtered accel (X is up)
-static float    lean = 0;                           // forward lean in degrees (+ = forward)
-static float    sideLean = 0;                       // sideways tilt in degrees (sign = direction)
+// --- posture data (combined from the two sensors)
+static float    lean = 0;                           // forward lean in degrees (+ = forward)  = top - bottom
+static float    sideLean = 0;                       // sideways tilt in degrees (sign = direction) = top - bottom
 static bool     pendingActive = false;
 static State    pendingState = ST_GOOD;
 static uint32_t pendingSince = 0;
@@ -384,6 +429,15 @@ static uint32_t lastErrRetryMs = 0;
 // --- feedback overlay (short blinking notification on the LED)
 static uint8_t  notifyR = 0, notifyG = 0, notifyB = 0;
 static uint32_t notifyUntilMs = 0;
+
+// --- early warning + slow-slouch state
+static bool     warnOn = false;                     // in the early-warning zone
+static float    trendBuf[TREND_SAMPLES];            // forward lean every 5 s, oldest first
+static int      trendCount = 0;
+static float    trendSlope = 0;                     // deg per minute
+static bool     trendValid = false;                 // false until 1 minute of data
+static uint32_t driftStartMs = 0;                   // when the last slow-slouch warning started
+static void trendReset() { trendCount = 0; trendValid = false; trendSlope = 0; }
 
 // ---------------------------------------------------------------------------
 //  Tilt helpers (X axis is up; Y and Z are the two horizontal axes)
@@ -413,13 +467,16 @@ static void enterError() {
   Serial.println("[ERROR] MPU6050 communication lost");
 }
 
+static void calReset(Tilt& T) { T.sx = T.sy = T.sz = T.gsx = T.gsy = T.gsz = 0; }
+
 static void startCalibration() {
   state = ST_CALIBRATING;
   hapticStop();
   playTone(SND_CAL_START, 1);
   calN = 0;
-  calSumX = calSumY = calSumZ = calGSumX = calGSumY = calGSumZ = 0;
+  calReset(topS); calReset(botS);
   calStartMs = millis();
+  trendReset();
   Serial.println("[CAL] Started – stay upright and still");
 }
 
@@ -438,29 +495,43 @@ static void toggleHaptics(uint32_t now) {
   notifyUntilMs = now + 900;
 }
 
-static void calibrationFeed(const ImuSample& s, uint32_t now) {
+static bool calMoving(const ImuSample& s) {
   float gmag = sqrtf(s.gx*s.gx + s.gy*s.gy + s.gz*s.gz);
   float amag = sqrtf(s.ax*s.ax + s.ay*s.ay + s.az*s.az);
-  if (gmag > CAL_MOTION_DPS || amag < 0.8f || amag > 1.2f) {   // moving -> restart averaging
+  return gmag > CAL_MOTION_DPS || amag < 0.8f || amag > 1.2f;
+}
+static void calAdd(Tilt& T, const ImuSample& s) {
+  T.sx += s.ax; T.sy += s.ay; T.sz += s.az;
+  T.gsx += s.gx; T.gsy += s.gy; T.gsz += s.gz;
+}
+static void calFinish(Tilt& T) {
+  float mx = T.sx / calN, my = T.sy / calN, mz = T.sz / calN;
+  T.refPitch = fwdAngle(mx, my, mz);                 // upright reference angles
+  T.refSide  = sideAngle(mx, my, mz);
+  T.gbx = T.gsx / calN; T.gby = T.gsy / calN; T.gbz = T.gsz / calN;
+  T.fx = mx; T.fy = my; T.fz = mz;
+  T.lean = 0; T.sideLean = 0;
+}
+
+static void calibrationFeed(const ImuSample& t, const ImuSample& b, uint32_t now) {
+  if (calMoving(t) || (botPresent && calMoving(b))) {   // either sensor moving -> restart averaging
     calN = 0;
-    calSumX = calSumY = calSumZ = calGSumX = calGSumY = calGSumZ = 0;
+    calReset(topS); calReset(botS);
   } else {
-    calSumX += s.ax; calSumY += s.ay; calSumZ += s.az;
-    calGSumX += s.gx; calGSumY += s.gy; calGSumZ += s.gz;
+    calAdd(topS, t);
+    if (botPresent) calAdd(botS, b);
     calN++;
   }
 
   if (calN >= CAL_SAMPLES) {
-    float mx = calSumX / calN, my = calSumY / calN, mz = calSumZ / calN;
-    refPitch = fwdAngle(mx, my, mz);                 // upright reference angles
-    refSide  = sideAngle(mx, my, mz);
-    gBiasX = calGSumX / calN; gBiasY = calGSumY / calN; gBiasZ = calGSumZ / calN;
-    fx = mx; fy = my; fz = mz;
+    calFinish(topS);
+    if (botPresent) calFinish(botS);
     lean = 0; sideLean = 0;
     pendingActive = false;
     state = ST_GOOD;
     playTone(SND_CAL_DONE, 3);
-    Serial.printf("[CAL] Done – monitoring posture (ref fwd %.1f, side %.1f deg)\n", refPitch, refSide);
+    Serial.printf("[CAL] Done – monitoring posture (top ref fwd %.1f side %.1f | bottom ref fwd %.1f side %.1f deg)\n",
+                  topS.refPitch, topS.refSide, botS.refPitch, botS.refSide);
   } else if (now - calStartMs > CAL_TIMEOUT_MS) {
     playTone(SND_ERROR, 3);
     enterIdle();
@@ -468,20 +539,31 @@ static void calibrationFeed(const ImuSample& s, uint32_t now) {
   }
 }
 
-static void postureFeed(const ImuSample& s, uint32_t now) {
-  float gx = s.gx - gBiasX, gy = s.gy - gBiasY, gz = s.gz - gBiasZ;
+// Updates one sensor's filtered accel + angles (relative to its own upright
+// reference) and returns its bias-corrected gyro magnitude.
+static float trackTilt(Tilt& T, const ImuSample& s) {
+  float gx = s.gx - T.gbx, gy = s.gy - T.gby, gz = s.gz - T.gbz;
   float gmag = sqrtf(gx*gx + gy*gy + gz*gz);
   float amag = sqrtf(s.ax*s.ax + s.ay*s.ay + s.az*s.az);
 
   if (amag > 0.75f && amag < 1.25f) {            // trust accel only near 1 g
-    fx += ACCEL_FILTER * (s.ax - fx);
-    fy += ACCEL_FILTER * (s.ay - fy);
-    fz += ACCEL_FILTER * (s.az - fz);
+    T.fx += ACCEL_FILTER * (s.ax - T.fx);
+    T.fy += ACCEL_FILTER * (s.ay - T.fy);
+    T.fz += ACCEL_FILTER * (s.az - T.fz);
   }
 
-  // Angles relative to the calibrated upright posture.
-  lean     = wrap180(FORWARD_SIGN * (fwdAngle(fx, fy, fz) - refPitch));   // + = forward
-  sideLean = wrap180(sideAngle(fx, fy, fz) - refSide);                    // left/right
+  T.lean     = wrap180(FORWARD_SIGN * (fwdAngle(T.fx, T.fy, T.fz) - T.refPitch));   // + = forward
+  T.sideLean = wrap180(sideAngle(T.fx, T.fy, T.fz) - T.refSide);                    // left/right
+  return gmag;
+}
+
+static void postureFeed(const ImuSample& t, const ImuSample& b, uint32_t now) {
+  float gmag = trackTilt(topS, t);
+  if (botPresent) gmag = fmaxf(gmag, trackTilt(botS, b));
+
+  // Two sensors: top relative to bottom. One sensor: top sensor on its own.
+  lean     = botPresent ? wrap180(topS.lean     - botS.lean)     : topS.lean;       // + = forward
+  sideLean = botPresent ? wrap180(topS.sideLean - botS.sideLean) : topS.sideLean;   // left/right
 
   if (gmag > MOTION_IGNORE_DPS) return;          // fast movement: hold decision
 
@@ -490,6 +572,10 @@ static void postureFeed(const ImuSample& s, uint32_t now) {
   bool fwdBad  = lean  > ((state == ST_BAD_FWD)  ? GOOD_ANGLE_DEG      : BAD_ANGLE_DEG);
   bool sideBad = aSide > ((state == ST_BAD_SIDE) ? SIDE_GOOD_ANGLE_DEG : SIDE_BAD_ANGLE_DEG);
   State target = fwdBad ? ST_BAD_FWD : (sideBad ? ST_BAD_SIDE : ST_GOOD);   // forward has priority
+
+  // early warning: still good, but past 70% of a limit
+  warnOn = (state == ST_GOOD) && target == ST_GOOD &&
+           (lean > EARLY_WARN_RATIO * BAD_ANGLE_DEG || aSide > EARLY_WARN_RATIO * SIDE_BAD_ANGLE_DEG);
 
   if (target == state) { pendingActive = false; return; }
 
@@ -503,11 +589,153 @@ static void postureFeed(const ImuSample& s, uint32_t now) {
   if (now - pendingSince >= holdMs) {
     state = target;
     pendingActive = false;
+    warnOn = false;
     hapticStop();
     if (target != ST_GOOD) badSinceMs = now;
     Serial.println(target == ST_BAD_FWD  ? "[POSTURE] Forward crouch detected" :
                    target == ST_BAD_SIDE ? "[POSTURE] Sideways tilt detected"  :
                                            "[POSTURE] Back to good posture");
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Slow-slouch detection: every 5 s store the forward lean, fit a straight
+//  line through the last 3 minutes (least squares) and look at its slope.
+//     slope = sum((x - xMean)(y - yMean)) / sum((x - xMean)^2)
+//  x = time in minutes, y = forward lean in degrees  ->  slope in deg/min
+// ---------------------------------------------------------------------------
+static void trendUpdate(uint32_t now) {
+  if (!isMonitoring()) { trendReset(); return; }
+
+  if (trendCount == TREND_SAMPLES) {                       // full: drop the oldest
+    for (int i = 1; i < TREND_SAMPLES; i++) trendBuf[i - 1] = trendBuf[i];
+    trendCount--;
+  }
+  trendBuf[trendCount++] = lean;
+
+  trendValid = trendCount >= TREND_MIN_SAMPLES;
+  if (!trendValid) return;
+
+  float step = TREND_SAMPLE_MS / 60000.0f;                 // minutes between samples
+  float xMean = (trendCount - 1) * step / 2, yMean = 0;
+  for (int i = 0; i < trendCount; i++) yMean += trendBuf[i];
+  yMean /= trendCount;
+  float num = 0, den = 0;
+  for (int i = 0; i < trendCount; i++) {
+    float dx = i * step - xMean;
+    num += dx * (trendBuf[i] - yMean);
+    den += dx * dx;
+  }
+  trendSlope = den > 0 ? num / den : 0;
+  float rise = trendBuf[trendCount - 1] - trendBuf[0];
+
+  // steadily leaning further forward, but not yet a crouch -> early reminder
+  if (state == ST_GOOD && trendSlope > DRIFT_SLOPE && rise > DRIFT_RISE &&
+      (driftStartMs == 0 || now - driftStartMs > DRIFT_REPEAT_MS)) {
+    driftStartMs = now;
+    playTone(SND_DRIFT, 3);
+    notifyR = 255; notifyG = 110; notifyB = 0;             // orange flash
+    notifyUntilMs = now + 1500;
+    Serial.printf("[TREND] Slow slouch detected: +%.1f deg/min\n", trendSlope);
+  }
+}
+static bool driftActive(uint32_t now) {
+  return driftStartMs != 0 && now - driftStartMs < DRIFT_SHOW_MS && state == ST_GOOD;
+}
+
+// ============================================================================
+//  WI-FI + DASHBOARD (WebSocket to server.js)
+// ============================================================================
+static WebSocketsClient socket;
+static bool serverConnected = false;
+static volatile bool calibrateRequested = false;    // set by the dashboard, done in loop()
+
+static const char* stateName(State s) {
+  static const char* names[] = {"IDLE", "CALIBRATING", "GOOD", "FORWARD", "SIDEWAYS", "ERROR"};
+  return names[s];
+}
+
+// Commands from the dashboard:
+//   {"threshold":25}  {"sideThreshold":20}
+//   {"cmd":"calibrate"}  {"cmd":"hapticsOn"}  {"cmd":"hapticsOff"}  {"cmd":"snooze"}
+static void handleCommand(const char* msg) {
+  uint32_t now = millis();
+  const char* p;
+  if ((p = strstr(msg, "\"threshold\"")) && (p = strchr(p, ':'))) {
+    float t = atof(p + 1);
+    if (t >= 5 && t <= 60) { BAD_ANGLE_DEG = t; GOOD_ANGLE_DEG = fmaxf(t - 10.0f, 3.0f); }
+  }
+  if ((p = strstr(msg, "\"sideThreshold\"")) && (p = strchr(p, ':'))) {
+    float t = atof(p + 1);
+    if (t >= 5 && t <= 60) { SIDE_BAD_ANGLE_DEG = t; SIDE_GOOD_ANGLE_DEG = fmaxf(t - 8.0f, 3.0f); }
+  }
+  if (strstr(msg, "\"calibrate\""))  calibrateRequested = true;
+  if (strstr(msg, "\"hapticsOn\""))  { if (!hapticEnabled) toggleHaptics(now); }
+  if (strstr(msg, "\"hapticsOff\"")) { if (hapticEnabled)  toggleHaptics(now); }
+  if (strstr(msg, "\"snooze\""))     hrAlarmSnooze(now);
+}
+
+static void onSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+  if (type == WStype_CONNECTED)         { serverConnected = true;  Serial.println("[WIFI] Dashboard server connected"); }
+  else if (type == WStype_DISCONNECTED) { serverConnected = false; }
+  else if (type == WStype_TEXT)         { handleCommand((const char*)payload); }
+}
+
+// {"state":"GOOD","fwd":3.2,"side":-1.0,"bpm":72,"motor":0,"haptics":1,"hrAlarm":0,
+//  "warn":0,"drift":0,"trend":0.4,"limit":25,"sideLimit":20,"dual":1}
+//  dual: 1 = top + bottom sensor, 0 = top sensor only
+static void sendReading(uint32_t now) {
+  bool angles = isMonitoring();
+  char fwd[12] = "null", side[12] = "null", bpm[12] = "null", tr[12] = "null";
+  if (angles) { snprintf(fwd, sizeof(fwd), "%.1f", lean); snprintf(side, sizeof(side), "%.1f", sideLean); }
+  if (hrOk && hrBpm > 0) snprintf(bpm, sizeof(bpm), "%d", hrBpm);
+  if (angles && trendValid) snprintf(tr, sizeof(tr), "%.1f", trendSlope);
+  char msg[256];
+  snprintf(msg, sizeof(msg),
+    "{\"state\":\"%s\",\"fwd\":%s,\"side\":%s,\"bpm\":%s,\"motor\":%d,\"haptics\":%d,\"hrAlarm\":%d,"
+    "\"warn\":%d,\"drift\":%d,\"trend\":%s,\"limit\":%.0f,\"sideLimit\":%.0f,\"dual\":%d}",
+    stateName(state), fwd, side, bpm,
+    (isBadPosture() && hapticEnabled) ? 1 : 0, hapticEnabled ? 1 : 0, hrAlarmActive ? 1 : 0,
+    warnOn ? 1 : 0, driftActive(now) ? 1 : 0, tr, BAD_ANGLE_DEG, SIDE_BAD_ANGLE_DEG, botPresent ? 1 : 0);
+  if (serverConnected) socket.sendTXT(msg);
+}
+
+static void wifiBegin() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  Serial.println("[WIFI] Looking for networks...");
+  int n = WiFi.scanNetworks();
+  bool found = false;
+  for (int i = 0; i < n; i++) {
+    Serial.printf("  [%s]  signal %d\n", WiFi.SSID(i).c_str(), WiFi.RSSI(i));
+    if (WiFi.SSID(i) == WIFI_SSID) found = true;
+  }
+  Serial.printf(found ? "[WIFI] Hotspot [%s] found - connecting...\n"
+                      : "[WIFI] Hotspot [%s] NOT found - check name / 2.4 GHz / distance\n", WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);               // C3 Super Mini: lower power connects reliably
+
+  static char path[96];
+  snprintf(path, sizeof(path), "/device?key=%s", DEVICE_KEY);
+  socket.begin(SERVER_IP, SERVER_PORT, path);
+  socket.onEvent(onSocketEvent);
+  socket.setReconnectInterval(5000);
+}
+
+static void wifiUpdate() {
+  static bool wasUp = false;
+  static uint32_t lastMsg = 0;
+  bool up = WiFi.status() == WL_CONNECTED;
+  if (up && !wasUp) { Serial.print("[WIFI] Connected, my IP: "); Serial.println(WiFi.localIP()); }
+  wasUp = up;
+  if (up) { socket.loop(); return; }
+  serverConnected = false;
+  if (millis() - lastMsg >= 5000) {
+    lastMsg = millis();
+    int st = WiFi.status();
+    Serial.println(st == WL_NO_SSID_AVAIL   ? "[WIFI] Hotspot not found (name wrong or 5 GHz)" :
+                   st == WL_CONNECT_FAILED ? "[WIFI] Connect failed (password wrong?)" :
+                                             "[WIFI] Still trying...");
   }
 }
 
@@ -599,7 +827,8 @@ static void renderLed(uint32_t now) {
       break;
     }
     case ST_GOOD:                                   // solid green
-      ledShow(0, 255, 0);
+      if (warnOn) ledShow(pulse(now, 1600, 60, 255), pulse(now, 1600, 25, 110), 0);  // orange breathing = early warning
+      else        ledShow(0, 255, 0);
       break;
     case ST_BAD_FWD:                                // red with gentle throb
       ledShow(pulse(now, 1500, 150, 255), 0, 0);
@@ -642,8 +871,13 @@ void setup() {
 
   bootSelfTest();
 
-  bool mpuOk = mpuInit();
-  Serial.println(mpuOk ? "[MPU6050] OK" : "[MPU6050] NOT FOUND (check wiring / address 0x69)");
+  bool topOk = mpuInit(MPU_TOP);
+  bool botOk = mpuInit(MPU_BOT);
+  Serial.println(topOk ? "[MPU6050 top 0x69] OK" : "[MPU6050 top 0x69] NOT FOUND (check wiring / AD0 = VCC)");
+  Serial.println(botOk ? "[MPU6050 bottom 0x68] OK" : "[MPU6050 bottom 0x68] NOT FOUND (check wiring / AD0 = GND)");
+  botPresent = botOk;                                   // bottom sensor is optional
+  bool mpuOk = topOk;                                   // top sensor is required
+  if (!botPresent) Serial.println("[MPU6050] Running in SINGLE-sensor mode (top only)");
   hrInit();
 
   if (mpuOk) {
@@ -652,11 +886,21 @@ void setup() {
   } else {
     enterError();
   }
+
+  wifiBegin();                                      // posture monitoring works with or without Wi-Fi
 }
 
 void loop() {
-  static uint32_t lastImuMs = 0, lastHrMs = 0, lastLedMs = 0, lastTelemetryMs = 0;
+  static uint32_t lastImuMs = 0, lastLedMs = 0, lastTelemetryMs = 0;
+  static uint32_t lastTrendMs = 0, lastSendMs = 0;
   uint32_t now = millis();
+
+  // ---- Wi-Fi + dashboard commands
+  wifiUpdate();
+  if (calibrateRequested) {
+    calibrateRequested = false;
+    if (state == ST_IDLE || isMonitoring()) startCalibration();
+  }
 
   // ---- Button
   BtnEvent ev = buttonUpdate(now);
@@ -669,34 +913,35 @@ void loop() {
     else if (ev == BTN_DOUBLE) toggleHaptics(now);
   }
 
-  // ---- IMU
+  // ---- IMU (both sensors are read every cycle)
   if (now - lastImuMs >= IMU_PERIOD_MS) {
     lastImuMs = now;
     if (state == ST_ERROR) {
       if (now - lastErrRetryMs >= 2000) {           // auto-recovery attempts
         lastErrRetryMs = now;
-        ImuSample t;
-        if (mpuInit() && mpuRead(t)) { imuFails = 0; enterIdle(); playTone(SND_CAL_DONE, 3);
-          Serial.println("[MPU6050] Recovered"); }
+        ImuSample t1, t2;
+        bool topUp = mpuInit(MPU_TOP);
+        bool botUp = !botPresent || mpuInit(MPU_BOT);
+        if (topUp && botUp && mpuRead(MPU_TOP, t1) && (!botPresent || mpuRead(MPU_BOT, t2))) {
+          imuFails = 0; enterIdle(); playTone(SND_CAL_DONE, 3);
+          Serial.println("[MPU6050] Recovered");
+        }
       }
     } else {
-      ImuSample s;
-      if (mpuRead(s)) {
+      ImuSample st, sb = {0, 0, 0, 0, 0, 0};        // top, bottom (bottom unused if absent)
+      if (mpuRead(MPU_TOP, st) && (!botPresent || mpuRead(MPU_BOT, sb))) {
         imuFails = 0;
-        if (state == ST_CALIBRATING)  calibrationFeed(s, now);
-        else if (isMonitoring())      postureFeed(s, now);
+        if (state == ST_CALIBRATING)  calibrationFeed(st, sb, now);
+        else if (isMonitoring())      postureFeed(st, sb, now);
       } else if (++imuFails >= 25) {
         enterError();
       }
     }
   }
 
-  // ---- Heart rate (polled every 20 ms) + abnormal-rate alarm
-  if (now - lastHrMs >= 20) {
-    lastHrMs = now;
-    hrUpdate(now);
-    hrAlarmUpdate(now);
-  }
+  // ---- Heart rate (read every loop so no sample is missed) + abnormal-rate alarm
+  hrUpdate(now);
+  hrAlarmUpdate(now);
 
   // ---- Haptics: escalate while posture stays bad (only if enabled)
   if (isBadPosture() && hapticEnabled) {
@@ -716,13 +961,21 @@ void loop() {
   // ---- LED + alarm buzzer (50 Hz)
   if (now - lastLedMs >= 20) { lastLedMs = now; renderLed(now); }
 
+  // ---- Slow-slouch trend (every 5 s)
+  if (now - lastTrendMs >= TREND_SAMPLE_MS) { lastTrendMs = now; trendUpdate(now); }
+
+  // ---- Reading to the dashboard
+  if (now - lastSendMs >= SEND_MS) { lastSendMs = now; sendReading(now); }
+
   // ---- Telemetry
   if (now - lastTelemetryMs >= TELEMETRY_MS) {
     lastTelemetryMs = now;
     static const char* names[] = {"IDLE", "CALIBRATING", "GOOD", "FORWARD", "SIDEWAYS", "ERROR"};
-    Serial.printf("state=%s fwd=%+.1f side=%+.1f deg haptics=%s | HR=%d bpm (IR=%ld) hrAlarm=%s%s\n",
+    Serial.printf("state=%s fwd=%+.1f side=%+.1f deg haptics=%s | HR=%d bpm (IR=%ld) hrAlarm=%s%s | warn=%d trend=%s%.1f wifi=%s\n",
                   names[state], lean, sideLean, hapticEnabled ? "ON" : "OFF",
                   hrBpm, hrLastIR, hrAlarmActive ? "ON" : "OFF",
-                  hrOk ? "" : " [sensor missing]");
+                  hrOk ? "" : " [sensor missing]",
+                  warnOn ? 1 : 0, trendValid ? "" : "(n/a) ", trendSlope,
+                  serverConnected ? "server" : (WiFi.status() == WL_CONNECTED ? "wifi-only" : "off"));
   }
 }
